@@ -1,31 +1,44 @@
-import { createContext, useState, useEffect, useContext } from "react";
-import io from "socket.io-client";
+import React, { createContext, useState, useEffect, useContext } from "react";
+import io, { Socket } from "socket.io-client";
 
-const SocketContext = createContext();
+const SocketContext = createContext({ socket: null, isConnected: false });
 
-export const useSocketContext = () => {
-  return useContext(SocketContext);
-};
+export const useSocketContext = () => useContext(SocketContext);
 
 export const SocketContextProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
-  const [onlineUsers, setOnlineUsers] = useState([]);
+  const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    const socket = io("https://localhost:3000");
-
-    setSocket(socket);
-
-    // socket.on() is used to listen to the events. can be used both on client and server side
-    socket.on("getOnlineUsers", (users) => {
-      setOnlineUsers(users);
+    const newSocket = io("http://localhost:9000", {
+      transports: ["websocket"],
+      upgrade: false,
     });
 
-    return () => socket.close();
+    newSocket.on("connect", () => {
+      console.log("Socket connected");
+      setIsConnected(true);
+    });
+
+    newSocket.on("disconnect", () => {
+      console.log("Socket disconnected");
+      setIsConnected(false);
+    });
+
+    newSocket.on("connect_error", (error) => {
+      console.error("Connection error:", error);
+      setIsConnected(false);
+    });
+
+    setSocket(newSocket);
+
+    return () => {
+      newSocket.disconnect();
+    };
   }, []);
 
   return (
-    <SocketContext.Provider value={{ socket, onlineUsers }}>
+    <SocketContext.Provider value={{ socket, isConnected }}>
       {children}
     </SocketContext.Provider>
   );

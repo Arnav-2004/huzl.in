@@ -1,5 +1,5 @@
 "use client";
-import React, { useState, useEffect, useContext } from "react";
+import React, { useState, useEffect, useContext, useCallback } from "react";
 import SidebarHelper from "../components/SidebarHelper";
 import axios from "axios";
 import {
@@ -9,12 +9,16 @@ import {
   MoreVertical,
   Flag,
   CheckSquare,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 import { format } from "date-fns";
 import { StoreContext } from "../context/StoreContext";
+import { useSocketContext } from "../context/SocketContext";
 
 export default function Task() {
   const { url, token } = useContext(StoreContext);
+  const { socket, isConnected } = useSocketContext();
 
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [isSubTaskOpen, setIsSubTaskOpen] = useState(false);
@@ -37,40 +41,77 @@ export default function Task() {
   const [editingTaskId, setEditingTaskId] = useState(null);
   const [currTaskId, setCurrTaskId] = useState(null);
 
-  async function fetchData() {
-    let getUsersUrl = url + "/api/user/users";
-    let getTasksUrl = url + "/api/task/tasks";
-
-    const getUsersResponse = await axios.get(getUsersUrl);
-    if (getUsersResponse.data.success) {
-      setUsers(getUsersResponse.data.users);
-    } else {
-      alert(getUsersResponse.data.message);
+  const handleSocketEvent = useCallback((eventType, data) => {
+    console.log("Received socket event:", eventType, data);
+    switch (eventType) {
+      case "taskCreated":
+        setTasks((prevTasks) => [...prevTasks, data]);
+        break;
+      case "taskUpdated":
+        setTasks((prevTasks) =>
+          prevTasks.map((task) => (task._id === data._id ? data : task))
+        );
+        break;
+      case "taskDeleted":
+        setTasks((prevTasks) =>
+          prevTasks.filter((task) => task._id !== data._id)
+        );
+        break;
+      default:
+        console.warn("Unknown event type:", eventType);
     }
+  }, []);
 
-    const getTasksUrlResponse = await axios.get(getTasksUrl, {
-      headers: { token },
-    });
-    if (getTasksUrlResponse.data.success) {
-      setTasks(getTasksUrlResponse.data.tasks);
-    } else {
-      alert(getTasksUrlResponse.data.message);
+  useEffect(() => {
+    if (socket) {
+      socket.on("taskEvent", handleSocketEvent);
+
+      return () => {
+        socket.off("taskEvent", handleSocketEvent);
+      };
+    }
+  }, [socket, handleSocketEvent]);
+
+  async function fetchData() {
+    try {
+      let getUsersUrl = url + "/api/user/users";
+      let getTasksUrl = url + "/api/task/tasks";
+
+      const [getUsersResponse, getTasksUrlResponse] = await Promise.all([
+        axios.get(getUsersUrl),
+        axios.get(getTasksUrl, { headers: { token } }),
+      ]);
+
+      if (getUsersResponse.data.success) {
+        setUsers(getUsersResponse.data.users);
+      } else {
+        console.error("Failed to fetch users:", getUsersResponse.data.message);
+      }
+
+      if (getTasksUrlResponse.data.success) {
+        setTasks(getTasksUrlResponse.data.tasks);
+      } else {
+        console.error(
+          "Failed to fetch tasks:",
+          getTasksUrlResponse.data.message
+        );
+      }
+    } catch (error) {
+      console.error("Error fetching data:", error);
     }
   }
 
   useEffect(() => {
     fetchData();
-  }, [url, token]);
+  }, [url, token, fetchData]);
 
   const handleInputChange = (e) => {
-    const name = e.target.name;
-    const value = e.target.value;
+    const { name, value } = e.target;
     setTaskData((prev) => ({ ...prev, [name]: value }));
   };
 
   const handleSubTaskChange = (e) => {
-    const name = e.target.name;
-    const value = e.target.value;
+    const { name, value } = e.target;
     setSubTaskData((prev) => ({ ...prev, [name]: value }));
   };
 
@@ -93,37 +134,41 @@ export default function Task() {
       ? `${url}/api/task/update/${editingTaskId}`
       : `${url}/api/task/create`;
     setIsLoading(true);
-    const response = await axios[editingTaskId ? "put" : "post"](
-      newUrl,
-      {
-        ...taskData,
-        team: taskData.team,
-        date: taskData.date.toISOString(),
-      },
-      { headers: { token } }
-    );
-    if (response.data.success) {
-      setIsFormOpen(false);
-      setTaskData({
-        title: "",
-        team: [],
-        stage: "",
-        date: new Date(),
-        priority: "",
-      });
-      setEditingTaskId(null);
+    try {
+      const response = await axios[editingTaskId ? "put" : "post"](
+        newUrl,
+        {
+          ...taskData,
+          team: taskData.team,
+          date: taskData.date.toISOString(),
+        },
+        { headers: { token } }
+      );
+      if (response.data.success) {
+        setIsFormOpen(false);
+        setTaskData({
+          title: "",
+          team: [],
+          stage: "",
+          date: new Date(),
+          priority: "",
+        });
+        setEditingTaskId(null);
 
-      const getTasksUrl = url + "/api/task/tasks";
-      const getTasksUrlResponse = await axios.get(getTasksUrl, {
-        headers: { token },
-      });
-      if (getTasksUrlResponse.data.success) {
-        setTasks(getTasksUrlResponse.data.tasks);
+        if (socket && isConnected) {
+          socket.emit("taskEvent", {
+            type: editingTaskId ? "taskUpdated" : "taskCreated",
+            data: response.data.task,
+          });
+        }
+      } else {
+        console.error(response.data.message);
       }
-    } else {
-      alert(response.data.message);
+    } catch (error) {
+      console.error("Error submitting task:", error);
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
   const handleDelete = async (taskId) => {
@@ -131,13 +176,17 @@ export default function Task() {
       const deleteUrl = `${url}/api/task/trash/${taskId}`;
       const response = await axios.delete(deleteUrl, { headers: { token } });
       if (response.data.success) {
-        setTasks(tasks.filter((task) => task._id !== taskId));
+        if (socket && isConnected) {
+          socket.emit("taskEvent", {
+            type: "taskDeleted",
+            data: { _id: taskId },
+          });
+        }
       } else {
-        alert(response.data.message);
+        console.error(response.data.message);
       }
     } catch (error) {
       console.error("Error deleting task:", error);
-      alert("Failed to delete task");
     }
   };
 
@@ -170,13 +219,19 @@ export default function Task() {
           tag: "",
         });
         setCurrTaskId(null);
+        if (socket && isConnected) {
+          socket.emit("taskEvent", {
+            type: "taskUpdated",
+            data: response.data.task,
+          });
+        }
       } else {
-        alert(response.data.message);
+        console.error(response.data.message);
       }
-      setIsLoading(false);
-      fetchData();
     } catch (error) {
       console.error("Error adding sub-task:", error);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -212,7 +267,17 @@ export default function Task() {
     <div className="relative min-h-screen">
       <SidebarHelper />
       <div className="p-4">
-        <div className="absolute top-8 right-8">
+        <div className="absolute top-8 right-8 flex items-center space-x-4">
+          <div className="flex items-center">
+            {isConnected ? (
+              <Wifi className="h-5 w-5 text-green-500" />
+            ) : (
+              <WifiOff className="h-5 w-5 text-red-500" />
+            )}
+            <span className="ml-2 text-sm">
+              {isConnected ? "Connected" : "Disconnected"}
+            </span>
+          </div>
           <button
             onClick={() => {
               setIsFormOpen(true);
@@ -289,7 +354,7 @@ export default function Task() {
                       </span>
                       <div className="p-4 space-x-10">
                         <span className="text-sm text-gray-600">
-                          {format(subTask.date, "yyyy-MM-dd")}
+                          {format(new Date(subTask.date), "yyyy-MM-dd")}
                         </span>
                         <span className="bg-blue-600/10 px-3 py-1 rounded-full text-blue-700 font-medium">
                           {subTask.tag}
@@ -531,7 +596,7 @@ export default function Task() {
 
                 <div>
                   <label
-                    htmlFor="title"
+                    htmlFor="tag"
                     className="block text-sm font-medium text-gray-700"
                   >
                     Tag
@@ -553,8 +618,7 @@ export default function Task() {
                 <button
                   type="button"
                   onClick={() => {
-                    setIsFormOpen(false);
-                    setEditingTaskId(null);
+                    setIsSubTaskOpen(false);
                   }}
                   className="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
                 >
